@@ -19,6 +19,8 @@ async function activate(context) {
   let liveReconnectDelay = 1000;
   const LIVE_WINDOW_MS = 3000;
   const DEFAULT_CHARS_PER_TOKEN = 3.5;
+  const subagents = new Map;
+  const SUBAGENT_RETENTION_MS = 60000;
   const env = () => {
     const g = globalThis;
     return g.process?.env ?? {};
@@ -32,10 +34,10 @@ async function activate(context) {
     return null;
   };
   const getSettings = () => ({
-    showTokens: settings.get("tokenCounter.showTokens", true),
+    showTokens: settings.get("tokenCounter.showTokens", false),
     showCacheRate: settings.get("tokenCounter.showCacheRate", true),
     showThroughput: settings.get("tokenCounter.showThroughput", true),
-    showCost: settings.get("tokenCounter.showCost", true),
+    showCost: settings.get("tokenCounter.showCost", false),
     fallbackCostPerMillion: settings.get("tokenCounter.costPerMillionTokens", settings.get("tokenCounter.fallbackCostPerMillion", 3))
   });
   const createEmptyStats = () => ({
@@ -221,10 +223,82 @@ async function activate(context) {
         }
       }
     }
+    const agentList = visibleSubagents();
+    if (agentList.length > 0) {
+      lines.push("");
+      lines.push(agentList.some((a) => !a.done) ? "Delegated agents:" : "Recent delegated agents:");
+      for (const agent of agentList) {
+        const bits = [];
+        if (agent.done) {
+          const elapsed = (agent.finishedAt ?? Date.now()) - agent.startedAt;
+          bits.push(`done in ${formatSeconds(elapsed)}`);
+          if (agent.tokensTotal > 0 && elapsed > 0) {
+            bits.push(`${formatTps(agent.tokensTotal / elapsed * 1000)} t/s avg`);
+          }
+        } else if (agent.tps !== null && agent.tps > 0) {
+          bits.push(`${formatTps(agent.tps)} t/s`);
+        } else {
+          bits.push("starting");
+        }
+        if (agent.tokensTotal > 0)
+          bits.push(`~${formatTokens(agent.tokensTotal)} tok`);
+        if (!agent.done && agent.firstTextAt !== null) {
+          bits.push(`TTFT ${formatSeconds(agent.firstTextAt - agent.startedAt)}`);
+        }
+        lines.push(`  ${subagentLabel(agent)} — ${bits.join(" · ")}`);
+      }
+    }
     lines.push("");
     lines.push("Click for details");
     return lines.join(`
 `);
+  };
+  const visibleSubagents = () => {
+    if (!currentThreadId)
+      return [];
+    const now = Date.now();
+    const list = [];
+    for (const state of subagents.values()) {
+      if (state.threadId !== currentThreadId)
+        continue;
+      if (state.done) {
+        const age = now - (state.finishedAt ?? state.startedAt);
+        if (age > SUBAGENT_RETENTION_MS) {
+          subagents.delete(state.taskId);
+          continue;
+        }
+      }
+      list.push(state);
+    }
+    list.sort((a, b) => {
+      if (a.done !== b.done)
+        return a.done ? 1 : -1;
+      return (b.finishedAt ?? b.startedAt) - (a.finishedAt ?? a.startedAt);
+    });
+    return list;
+  };
+  const activeSubagents = () => visibleSubagents().filter((s) => !s.done);
+  const subagentSummary = () => {
+    const running = activeSubagents();
+    if (running.length === 0)
+      return null;
+    let tps = 0;
+    let sawTps = false;
+    let tokens = 0;
+    for (const state of running) {
+      if (state.tps !== null && state.tps > 0) {
+        tps += state.tps;
+        sawTps = true;
+      }
+      tokens += state.tokensTotal;
+    }
+    return { running: running.length, tps: sawTps ? tps : null, tokens };
+  };
+  const subagentLabel = (state) => {
+    const name = state.label?.trim();
+    if (name)
+      return name;
+    return state.taskId.slice(0, 8);
   };
   let statusBarTimer = null;
   const MIN_PAINT_INTERVAL_MS = 250;
@@ -245,8 +319,9 @@ async function activate(context) {
     lastPaintAt = Date.now();
     const stats = getCurrentStats();
     const { showTokens, showCacheRate, showThroughput, showCost } = getSettings();
-    if (stats.totalTokens === 0 && !stats.lastTurn && !live) {
-      statusBarItem.text = "Tokens: 0";
+    const hasAgents = visibleSubagents().length > 0;
+    if (stats.totalTokens === 0 && !stats.lastTurn && !live && !hasAgents) {
+      statusBarItem.text = showTokens ? "Tokens: 0" : "…";
       statusBarItem.tooltip = "No token usage in this thread yet";
       return;
     }
@@ -270,7 +345,17 @@ async function activate(context) {
     }
     if (showCost && stats.totalCost > 0)
       segments.push(formatCost(stats.totalCost));
-    statusBarItem.text = segments.length > 0 ? segments.join(" · ") : `${formatTokens(stats.totalTokens)} tok`;
+    const subs = subagentSummary();
+    if (showThroughput && subs) {
+      const agents = subs.running === 1 ? "1 agent" : `${subs.running} agents`;
+      const speed = subs.tps !== null ? ` · ${formatTps(subs.tps)} t/s` : "";
+      segments.push(`${agents}${speed}`);
+    }
+    if (segments.length > 0) {
+      statusBarItem.text = segments.join(" · ");
+    } else {
+      statusBarItem.text = showTokens ? `${formatTokens(stats.totalTokens)} tok` : "…";
+    }
     statusBarItem.tooltip = buildTooltip(stats);
   };
   const wsUrl = () => {
@@ -348,6 +433,93 @@ async function activate(context) {
     live = null;
     updateStatusBar();
   };
+  const ensureSubagent = (context2) => {
+    const taskId = context2?.taskId;
+    const threadId = context2?.threadId;
+    if (!taskId || !threadId)
+      return null;
+    const existing = subagents.get(taskId);
+    if (existing) {
+      if (!existing.done)
+        return existing;
+      subagents.delete(taskId);
+    }
+    const fresh = {
+      taskId,
+      threadId,
+      startedAt: Date.now(),
+      firstTextAt: null,
+      window: [],
+      charsTotal: 0,
+      tokensTotal: 0,
+      tps: null,
+      done: false
+    };
+    subagents.set(taskId, fresh);
+    return fresh;
+  };
+  const subagentCharsPerToken = (threadId) => charsPerTokenFor(threadId);
+  const handleSubagentDelta = (data) => {
+    const context2 = data?.context;
+    if (!context2)
+      return;
+    const finished = subagents.get(context2.taskId);
+    if (finished?.done)
+      return;
+    const state = ensureSubagent(context2);
+    if (!state || state.done)
+      return;
+    let chars = 0;
+    for (const delta of data?.deltas ?? []) {
+      if (delta?.type === "text_append" && typeof delta.text === "string") {
+        chars += delta.text.length;
+      }
+    }
+    if (chars <= 0)
+      return;
+    const now = Date.now();
+    if (state.firstTextAt === null)
+      state.firstTextAt = now;
+    state.charsTotal += chars;
+    const tokens = chars / subagentCharsPerToken(state.threadId);
+    state.tokensTotal += tokens;
+    state.window.push({ t: now, tokens });
+    const cutoff = now - LIVE_WINDOW_MS;
+    while (state.window.length > 0 && state.window[0].t < cutoff)
+      state.window.shift();
+    const tokenSum = state.window.reduce((sum, sample) => sum + sample.tokens, 0);
+    const spanMs = state.window.length > 1 ? now - state.window[0].t : 0;
+    if (spanMs >= 800) {
+      state.tps = tokenSum / spanMs * 1000;
+    } else if (state.firstTextAt !== null) {
+      const elapsed = now - state.firstTextAt;
+      if (elapsed >= 400)
+        state.tps = state.tokensTotal / elapsed * 1000;
+    }
+    scheduleStatusBarUpdate();
+  };
+  const handleSubagentLifecycle = (type, data) => {
+    const context2 = data?.context;
+    if (!context2)
+      return;
+    if (type === "subagent_message_added") {
+      const state2 = ensureSubagent(context2);
+      const label = data?.message?.parts?.find((p) => typeof p?.text === "string" && p.text.trim())?.text?.slice(0, 40);
+      if (state2 && label && !state2.label)
+        state2.label = label.replace(/\s+/g, " ").trim();
+      if (state2)
+        scheduleStatusBarUpdate();
+      return;
+    }
+    const state = subagents.get(context2.taskId);
+    if (!state)
+      return;
+    state.done = true;
+    state.finishedAt = Date.now();
+    state.tps = null;
+    state.window = [];
+    scheduleStatusBarUpdate();
+  };
   const handleLiveMessage = (raw) => {
     let msg;
     try {
@@ -356,6 +528,14 @@ async function activate(context) {
       return;
     }
     const type = msg?.type;
+    if (type === "subagent_message_added" || type === "subagent_message_completed") {
+      handleSubagentLifecycle(type, msg.data);
+      return;
+    }
+    if (type === "subagent_message_delta") {
+      handleSubagentDelta(msg.data);
+      return;
+    }
     if (type === "thread_generating") {
       const data2 = msg.data ?? {};
       if (data2.generating === false && data2.threadId === currentThreadId) {
@@ -618,7 +798,8 @@ async function activate(context) {
   });
   const showDetails = async () => {
     const stats = getCurrentStats();
-    if (stats.totalTokens === 0 && !stats.lastTurn) {
+    const agentList = visibleSubagents();
+    if (stats.totalTokens === 0 && !stats.lastTurn && agentList.length === 0) {
       ui.showNotification("No token usage in this thread yet", { type: "info" });
       return;
     }
@@ -629,6 +810,9 @@ async function activate(context) {
       { label: "Input", description: formatExact(stats.promptTokens) },
       { label: "Output", description: formatExact(stats.completionTokens) }
     ];
+    if (stats.reasoningTokens > 0) {
+      items.push({ label: "of which reasoning", description: formatExact(stats.reasoningTokens) });
+    }
     if (rate !== null) {
       items.push({
         label: "Prompt cache hit",
@@ -648,7 +832,30 @@ async function activate(context) {
       items.push({ label: "Time to first token", description: formatSeconds(stats.lastTurn.ttftMs) });
     }
     if (stats.totalCost > 0) {
-      items.push({ label: "Estimated cost", description: formatCost(stats.totalCost) });
+      const parts = [];
+      if (stats.inputCost > 0)
+        parts.push(`in ${formatCost(stats.inputCost)}`);
+      if (stats.cacheReadCost > 0)
+        parts.push(`cache ${formatCost(stats.cacheReadCost)}`);
+      if (stats.outputCost > 0)
+        parts.push(`out ${formatCost(stats.outputCost)}`);
+      items.push({
+        label: "Estimated cost",
+        description: parts.length > 0 ? `${formatCost(stats.totalCost)}  (${parts.join(" · ")})` : formatCost(stats.totalCost)
+      });
+    }
+    for (const agent of agentList) {
+      const bits = [];
+      if (agent.done) {
+        bits.push(`done in ${formatSeconds((agent.finishedAt ?? Date.now()) - agent.startedAt)}`);
+      } else if (agent.tps !== null && agent.tps > 0) {
+        bits.push(`${formatTps(agent.tps)} tok/s`);
+      } else {
+        bits.push("starting");
+      }
+      if (agent.tokensTotal > 0)
+        bits.push(`~${formatTokens(agent.tokensTotal)} tok`);
+      items.push({ label: `Agent · ${subagentLabel(agent)}`, description: bits.join(" · ") });
     }
     await ui.showQuickPick(items, { title: "Token usage — this thread" });
   };

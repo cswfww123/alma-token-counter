@@ -1,7 +1,7 @@
 {
     "id": "token-counter-plus",
     "name": "Token Counter Plus",
-    "version": "1.2.0",
+    "version": "1.4.0",
     "description": "Token count, prompt-cache hit rate, live streaming throughput (tok/s) and cost with per-feature toggles",
     "author": {
         "name": "cswfww123"
@@ -32,8 +32,8 @@
             "properties": {
                 "tokenCounter.showTokens": {
                     "type": "boolean",
-                    "default": true,
-                    "description": "Show total token count in the status bar"
+                    "default": false,
+                    "description": "Show total token count inline in the status bar (off by default; always available on click)"
                 },
                 "tokenCounter.showCacheRate": {
                     "type": "boolean",
@@ -47,8 +47,8 @@
                 },
                 "tokenCounter.showCost": {
                     "type": "boolean",
-                    "default": true,
-                    "description": "Show estimated cost alongside token count"
+                    "default": false,
+                    "description": "Show estimated cost inline in the status bar (off by default; always available on click)"
                 },
                 "tokenCounter.costPerMillionTokens": {
                     "type": "number",
