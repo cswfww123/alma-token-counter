@@ -1,0 +1,8 @@
+node_modules/
+.DS_Store
+*.log
+
+# Lockfiles from a local build environment
+package-lock.json
+pnpm-lock.yaml
+bun.lockb

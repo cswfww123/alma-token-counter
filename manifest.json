@@ -1,0 +1,61 @@
+{
+    "id": "token-counter-plus",
+    "name": "Token Counter Plus",
+    "version": "1.2.0",
+    "description": "Token count, prompt-cache hit rate, live streaming throughput (tok/s) and cost with per-feature toggles",
+    "author": {
+        "name": "cswfww123"
+    },
+    "main": "main.js",
+    "engines": {
+        "alma": "^0.1.0"
+    },
+    "type": "ui",
+    "permissions": [
+        "chat:read"
+    ],
+    "activationEvents": [
+        "onStartup"
+    ],
+    "contributes": {
+        "components": {
+            "statusBar": [
+                {
+                    "id": "token-counter-plus.statusBar",
+                    "alignment": "right",
+                    "priority": 100
+                }
+            ]
+        },
+        "configuration": {
+            "title": "Token Counter Plus",
+            "properties": {
+                "tokenCounter.showTokens": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Show total token count in the status bar"
+                },
+                "tokenCounter.showCacheRate": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Show prompt cache hit rate (cached tokens / prompt tokens)"
+                },
+                "tokenCounter.showThroughput": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Show generation speed in tokens per second"
+                },
+                "tokenCounter.showCost": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Show estimated cost alongside token count"
+                },
+                "tokenCounter.costPerMillionTokens": {
+                    "type": "number",
+                    "default": 3.0,
+                    "description": "Fallback cost per million tokens (USD) when the model has no pricing data"
+                }
+            }
+        }
+    }
+}
