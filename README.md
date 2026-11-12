@@ -9,20 +9,55 @@ or gets overwritten by the bundled `token-counter`.
 
 ## What it shows
 
+The inline bar carries only what moves — cache hit rate, speed, and running
+agents:
+
 ```
-247.4k tok · 99.7% cache · 172 t/s · $0.0764
+99.8% cache · 172 t/s · 2 agents · 696 t/s
 ```
 
 | Segment | Meaning |
 | --- | --- |
-| `247.4k tok` | Total tokens for the thread, accumulated across turns |
-| `99.7% cache` | Prompt-cache hit rate: `cached / prompt`. One decimal near 100% so 99.8% is never rounded up to a lie |
-| `172 t/s` | Generation speed. Live sample while streaming, persisted value afterwards |
-| `$0.0764` | Estimated cost, using the model's real pricing when available |
+| `99.8% cache` | Prompt-cache hit rate: `cached / prompt`. One decimal near 100% so 99.8% is never rounded up to a lie |
+| `172 t/s` | This thread's generation speed. Live sample while streaming, persisted value afterwards |
+| `2 agents · 696 t/s` | Running delegated subagents and their combined throughput |
 
-Hover for a full breakdown: input/output/reasoning split, cached vs. uncached
-prompt tokens, TTFT, stream duration, average speed, and per-1M pricing.
-Click for a compact detail panel.
+Token totals and cost are **hidden by default** — they change slowly and mostly
+add noise next to the composer. Toggle them back on with `showTokens` /
+`showCost` in settings.
+
+Everything is still reachable two ways:
+
+- **Hover** — input/output/reasoning split, cached vs. uncached prompt tokens,
+  TTFT, stream duration, average speed, per-1M pricing, and a per-agent
+  breakdown.
+- **Click** — a detail panel with the same numbers plus a cost breakdown
+  (input / cache / output).
+
+## Delegated subagents
+
+Task subagents stream on their own channel (`subagent_message_*`), tagged with a
+task ID and the parent thread. Each one gets an independent 3-second rolling
+window, so several concurrent agents do not blur into one misleading average.
+
+While an agent runs, the bar shows `1 agent · 394 t/s`. Hover to see which agent
+is which:
+
+```
+Delegated agents:
+  Researcher task — 465 t/s · ~617 tok · TTFT 0.12s
+  Reviewer task — done in 1.50s · 411 t/s avg · ~617 tok
+```
+
+Finished agents keep their row for a minute so their final numbers can be read,
+then drop out. Late deltas arriving after a completion event are ignored, so a
+finished run cannot appear to restart.
+
+Note: Alma renders the subagent row inside the chat transcript itself, and the
+plugin manifest only allows `sidebar` / `settingsPanels` / `toolbar` /
+`contextMenus` / `artifactRenderers` / `statusBar` contributions. There is no
+hook to inject text into that row, which is why this lives in the status bar
+instead.
 
 ## Why a fork
 
@@ -70,11 +105,14 @@ All four segments can be toggled independently:
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `tokenCounter.showTokens` | `true` | Total token count |
 | `tokenCounter.showCacheRate` | `true` | Prompt-cache hit rate |
-| `tokenCounter.showThroughput` | `true` | Generation speed |
-| `tokenCounter.showCost` | `true` | Estimated cost |
+| `tokenCounter.showThroughput` | `true` | Generation speed and running agents |
+| `tokenCounter.showTokens` | `false` | Total token count inline |
+| `tokenCounter.showCost` | `false` | Estimated cost inline |
 | `tokenCounter.costPerMillionTokens` | `3.0` | Fallback price when the model has no pricing data |
+
+Hiding a segment only affects the inline text — it never removes that data from
+the tooltip or the click panel.
 
 ## Development
 
