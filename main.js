@@ -321,10 +321,11 @@ async function activate(context) {
     const { showTokens, showCacheRate, showThroughput, showCost } = getSettings();
     const hasAgents = visibleSubagents().length > 0;
     if (stats.totalTokens === 0 && !stats.lastTurn && !live && !hasAgents) {
-      statusBarItem.text = showTokens ? "Tokens: 0" : "…";
+      statusBarItem.hide();
       statusBarItem.tooltip = "No token usage in this thread yet";
       return;
     }
+    statusBarItem.show();
     const segments = [];
     if (showTokens && stats.totalTokens > 0)
       segments.push(`${formatTokens(stats.totalTokens)} tok`);
@@ -353,8 +354,12 @@ async function activate(context) {
     }
     if (segments.length > 0) {
       statusBarItem.text = segments.join(" · ");
+    } else if (showTokens) {
+      statusBarItem.text = `${formatTokens(stats.totalTokens)} tok`;
     } else {
-      statusBarItem.text = showTokens ? `${formatTokens(stats.totalTokens)} tok` : "…";
+      statusBarItem.hide();
+      statusBarItem.tooltip = buildTooltip(stats);
+      return;
     }
     statusBarItem.tooltip = buildTooltip(stats);
   };
@@ -432,6 +437,42 @@ async function activate(context) {
     }
     live = null;
     updateStatusBar();
+  };
+  const adoptThread = (threadId) => {
+    if (currentThreadId === threadId)
+      return;
+    currentThreadId = threadId;
+    live = null;
+    refreshServerActiveThread();
+    scheduleSync(threadId, 0);
+  };
+  let serverActiveThread = null;
+  let sawExplicitSwitch = false;
+  const refreshServerActiveThread = async () => {
+    try {
+      const thread = await context.chat?.getActiveThread?.();
+      const id = thread?.id ?? null;
+      serverActiveThread = id;
+      return id;
+    } catch {
+      return serverActiveThread;
+    }
+  };
+  const pendingConfirmations = new Map;
+  const confirmThreadFromServer = (threadId) => {
+    const inFlight = pendingConfirmations.get(threadId);
+    if (inFlight)
+      return inFlight;
+    const check = refreshServerActiveThread().then((active) => active === threadId).catch(() => false).finally(() => pendingConfirmations.delete(threadId));
+    pendingConfirmations.set(threadId, check);
+    return check;
+  };
+  const isThreadConfirmed = (threadId) => {
+    if (sawExplicitSwitch)
+      return threadId === currentThreadId;
+    if (serverActiveThread === null)
+      return true;
+    return serverActiveThread === threadId;
   };
   const ensureSubagent = (context2) => {
     const taskId = context2?.taskId;
@@ -556,8 +597,19 @@ async function activate(context) {
     const threadId = data.threadId;
     if (!threadId)
       return;
-    if (threadId !== currentThreadId)
-      return;
+    if (threadId !== currentThreadId) {
+      const confirmed = isThreadConfirmed(threadId);
+      if (currentThreadId !== null && !confirmed) {
+        if (!pendingConfirmations.has(threadId)) {
+          confirmThreadFromServer(threadId).then((ok) => {
+            if (ok && !disposed)
+              adoptThread(threadId);
+          });
+        }
+        return;
+      }
+      adoptThread(threadId);
+    }
     let chars = 0;
     for (const delta of data.deltas ?? []) {
       if (delta?.type === "text_append" && typeof delta.text === "string") {
@@ -782,6 +834,8 @@ async function activate(context) {
     if (live && live.threadId !== threadId)
       live = null;
     currentThreadId = threadId;
+    serverActiveThread = threadId;
+    sawExplicitSwitch = true;
     if (usage) {
       const base = {
         ...createEmptyStats(),
@@ -866,12 +920,13 @@ async function activate(context) {
   });
   statusBarItem.command = `${context.id}.showDetails`;
   updateStatusBar();
-  statusBarItem.show();
   connectLiveSocket();
   const restoreActiveThread = async () => {
     try {
       const thread = await context.chat?.getActiveThread?.();
       const threadId = thread?.id;
+      if (threadId)
+        serverActiveThread = threadId;
       if (!threadId || disposed || currentThreadId)
         return;
       currentThreadId = threadId;
@@ -881,6 +936,19 @@ async function activate(context) {
     }
   };
   restoreActiveThread();
+  let activePollTimer = null;
+  activePollTimer = setInterval(async () => {
+    if (disposed)
+      return;
+    const threadId = await refreshServerActiveThread();
+    if (!threadId || disposed || threadId === currentThreadId)
+      return;
+    if (live)
+      return;
+    currentThreadId = threadId;
+    sawExplicitSwitch = true;
+    scheduleSync(threadId, 0);
+  }, 5000);
   const settingsDisposable = settings.onDidChange(() => {
     for (const [threadId, stats] of threadStats.entries()) {
       threadStats.set(threadId, withRecalculatedCost(stats));
@@ -895,6 +963,8 @@ async function activate(context) {
         clearTimeout(refreshTimer);
       if (statusBarTimer)
         clearTimeout(statusBarTimer);
+      if (activePollTimer)
+        clearInterval(activePollTimer);
       disconnectLiveSocket();
       willSendDisposable.dispose();
       messageDisposable.dispose();

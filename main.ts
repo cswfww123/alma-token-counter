@@ -497,12 +497,13 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         // its own, so they have to keep the bar alive too.
         const hasAgents = visibleSubagents().length > 0;
         if (stats.totalTokens === 0 && !stats.lastTurn && !live && !hasAgents) {
-            // Idle and nothing counted: show the compact label rather than a
-            // bare "0" that looks like a broken counter.
-            statusBarItem.text = showTokens ? 'Tokens: 0' : '…';
+            // Nothing to report yet. Hiding the item entirely beats flashing a
+            // placeholder every time the plugin reloads or a thread is opening.
+            statusBarItem.hide();
             statusBarItem.tooltip = 'No token usage in this thread yet';
             return;
         }
+        statusBarItem.show();
 
         const segments: string[] = [];
 
@@ -545,8 +546,14 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         // of resurfacing the token count the user asked to hide.
         if (segments.length > 0) {
             statusBarItem.text = segments.join(' · ');
+        } else if (showTokens) {
+            statusBarItem.text = `${formatTokens(stats.totalTokens)} tok`;
         } else {
-            statusBarItem.text = showTokens ? `${formatTokens(stats.totalTokens)} tok` : '…';
+            // Every visible segment was toggled off: keep the item out of the
+            // way rather than showing a meaningless placeholder.
+            statusBarItem.hide();
+            statusBarItem.tooltip = buildTooltip(stats);
+            return;
         }
         statusBarItem.tooltip = buildTooltip(stats);
     };
@@ -637,6 +644,73 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         }
         live = null;
         updateStatusBar();
+    };
+
+    /**
+     * Which thread the user is looking at, as far as the plugin can tell.
+     *
+     * thread.activated is authoritative but only fires on an explicit switch,
+     * and it can be missed (plugin reloaded mid-thread, app restored with a
+     * thread already open). So the plugin also watches for generation activity
+     * and adopts a thread the first time it streams — guarded by a short window
+     * so a background cron or subagent run cannot steal the bar.
+     */
+    const adoptThread = (threadId: string) => {
+        if (currentThreadId === threadId) return;
+        currentThreadId = threadId;
+        live = null;
+        void refreshServerActiveThread();
+        scheduleSync(threadId, 0);
+    };
+
+    // Which thread the server considers active, refreshed on a slow cadence and
+    // consulted when a delta arrives for a thread we aren't showing. Null means
+    // "not known yet", in which case deltas are trusted so the first stream
+    // after a reload is not dropped.
+    let serverActiveThread: string | null = null;
+    // Set once the plugin has seen a real thread.activated. From then on that
+    // event is the only thing allowed to move the bar between threads; before
+    // it, deltas are the only evidence available and are trusted.
+    let sawExplicitSwitch = false;
+
+    const refreshServerActiveThread = async (): Promise<string | null> => {
+        try {
+            const thread = await context.chat?.getActiveThread?.();
+            const id = (thread as { id?: string } | undefined)?.id ?? null;
+            serverActiveThread = id;
+            return id;
+        } catch {
+            return serverActiveThread;
+        }
+    };
+
+    // A delta for another thread is only adopted when it matches the thread the
+    // server says is active. That keeps cron runs and subagents from hijacking
+    // the bar while still recovering from a missed thread.activated.
+    //
+    // The cached value can lag behind a switch, so a recent explicit switch wins
+    // and a live query settles the rest.
+    const pendingConfirmations = new Map<string, Promise<boolean>>();
+
+    const confirmThreadFromServer = (threadId: string): Promise<boolean> => {
+        const inFlight = pendingConfirmations.get(threadId);
+        if (inFlight) return inFlight;
+
+        const check = refreshServerActiveThread()
+            .then((active) => active === threadId)
+            .catch(() => false)
+            .finally(() => pendingConfirmations.delete(threadId));
+
+        pendingConfirmations.set(threadId, check);
+        return check;
+    };
+
+    const isThreadConfirmed = (threadId: string): boolean => {
+        // An explicit thread.activated always wins over the cached value: it is
+        // the user's own action, and currentThreadId already reflects it.
+        if (sawExplicitSwitch) return threadId === currentThreadId;
+        if (serverActiveThread === null) return true;
+        return serverActiveThread === threadId;
     };
 
     const ensureSubagent = (context: any): SubagentState | null => {
@@ -787,7 +861,28 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         // The socket carries deltas for every thread — background work,
         // subagents, cron runs. Sampling those produced nonsense like
         // "0 tok · 171 t/s" on an idle thread, so only the displayed thread counts.
-        if (threadId !== currentThreadId) return;
+        //
+        // The exception is the thread we're unsure about: right after a switch
+        // the plugin may not have received thread.activated yet, and refusing
+        // the deltas would leave the bar blank for a thread that is plainly
+        // streaming. Those deltas are what prove which thread the user is on.
+        if (threadId !== currentThreadId) {
+            // Adopt freely until the plugin has a thread to show. After that a
+            // different thread is only taken over when the switch was explicit
+            // or the server confirms it, so background runs stay out.
+            const confirmed = isThreadConfirmed(threadId);
+            if (currentThreadId !== null && !confirmed) {
+                // Fire-and-forget verification; if the server agrees, adopt on
+                // the next delta rather than blocking this one.
+                if (!pendingConfirmations.has(threadId)) {
+                    void confirmThreadFromServer(threadId).then((ok) => {
+                        if (ok && !disposed) adoptThread(threadId);
+                    });
+                }
+                return;
+            }
+            adoptThread(threadId);
+        }
 
         let chars = 0;
         for (const delta of data.deltas ?? []) {
@@ -1083,6 +1178,8 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         // Switching threads invalidates any in-flight live sample.
         if (live && live.threadId !== threadId) live = null;
         currentThreadId = threadId;
+        serverActiveThread = threadId;
+        sawExplicitSwitch = true;
 
         if (usage) {
             const base: ThreadStats = {
@@ -1175,18 +1272,24 @@ export async function activate(context: PluginContext): Promise<PluginActivation
 
     // Status bar clicks are dispatched through the fully qualified command id.
     statusBarItem.command = `${context.id}.showDetails`;
+    // updateStatusBar decides whether there is anything worth showing; the
+    // initial paint must not force the item visible.
     updateStatusBar();
-    statusBarItem.show();
 
     // Stream throughput updates live; the HTTP endpoint only has finished turns.
     connectLiveSocket();
 
     // A plugin reload (or app start) happens with a thread already open and no
     // fresh thread.activated event, which would leave the bar stuck at zero.
+    // Prime the bar on activation. This is only a best guess — getActiveThread
+    // can point at a background thread — so it deliberately does NOT mark the
+    // thread as confirmed. If a different thread turns out to be the one
+    // streaming, the delta handler will adopt it.
     const restoreActiveThread = async () => {
         try {
             const thread = await context.chat?.getActiveThread?.();
             const threadId = (thread as { id?: string } | undefined)?.id;
+            if (threadId) serverActiveThread = threadId;
             if (!threadId || disposed || currentThreadId) return;
             currentThreadId = threadId;
             await syncFromApi(threadId);
@@ -1195,6 +1298,24 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         }
     };
     void restoreActiveThread();
+
+    // The plugin cannot observe thread switches directly; ask the server who is
+    // active on a slow cadence as a fallback, so a missed thread.activated does
+    // not pin the bar to a stale thread forever.
+    let activePollTimer: ReturnType<typeof setInterval> | null = null;
+    activePollTimer = setInterval(async () => {
+        if (disposed) return;
+        const threadId = await refreshServerActiveThread();
+        if (!threadId || disposed || threadId === currentThreadId) return;
+        // Only follow the reported active thread when nothing is streaming
+        // here, so a live sample is never yanked away mid-turn.
+        if (live) return;
+        currentThreadId = threadId;
+        // The server confirmed this switch, so trust it the same way an
+        // explicit thread.activated would be trusted.
+        sawExplicitSwitch = true;
+        void scheduleSync(threadId, 0);
+    }, 5000);
 
     const settingsDisposable = settings.onDidChange(() => {
         for (const [threadId, stats] of threadStats.entries()) {
@@ -1209,6 +1330,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
             logger.info('Token Counter plugin deactivated');
             if (refreshTimer) clearTimeout(refreshTimer);
             if (statusBarTimer) clearTimeout(statusBarTimer);
+            if (activePollTimer) clearInterval(activePollTimer);
             disconnectLiveSocket();
             willSendDisposable.dispose();
             messageDisposable.dispose();

@@ -1,7 +1,7 @@
 {
     "id": "token-counter-plus",
     "name": "Token Counter Plus",
-    "version": "1.4.0",
+    "version": "1.5.0",
     "description": "Token count, prompt-cache hit rate, live streaming throughput (tok/s) and cost with per-feature toggles",
     "author": {
         "name": "cswfww123"
